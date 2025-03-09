@@ -4,51 +4,54 @@ import * as secrets from './secrets.json';
 import { google } from 'googleapis';
 import { GoogleAuth } from 'google-auth-library';
 
+interface ArtistInfoData {
+  name: string;
+}
+
+interface ArtistInfoResponse {
+  imageUrl: string | null;
+}
+
 /**
  * Searches an artist and returns some information about him.
  * Currently only returns thet artist image url.
  */
-export const getArtistInfo = functions.https.onCall(async (data, context) => {
-  if (!data.name) {
+export const getArtistInfoV2 = functions.https.onCall(async (data: functions.https.CallableRequest<ArtistInfoData>, context): Promise<ArtistInfoResponse> => {
+  const { name } = data.data;
+
+  if (!name) {
     throw new functions.https.HttpsError('invalid-argument', 'The `name` argument is required');
   }
-  const { version } = data;
-  if (!version) {
-    throw new functions.https.HttpsError('invalid-argument', 'The `version` argument is required');
+
+  const result = await axios.get('https://api.genius.com/search', {
+    params: { q: name },
+    headers: {
+      'Authorization': `Bearer ${secrets.genius_token}`,
+      'Content-Type': 'application/json',
+    }
+  });
+  if (result.status < 200 || result.status >= 300) {
+    throw new functions.https.HttpsError('unknown', 'Genius query failed', `${result.status} ${result.statusText}`);
   }
-  // I initially decided to use integers for API versions, but then changed my mind
-  // to use semver.
-  if (version === 1 || version === '1.0.0') {
-    const result = await axios.get('https://api.genius.com/search', {
-      params: {
-        q: data.name,
-      },
-      headers: {
-        'Authorization': `Bearer ${secrets.genius_token}`,
-        'Content-Type': 'application/json',
-      }
-    });
-    if (result.status < 200 || result.status >= 300) {
-      throw new functions.https.HttpsError('unknown', 'Genius query failed', `${result.status} ${result.statusText}`);
-    }
-    let imageUrl;
-    if (result.status === 204 || result.data.response.hits.length === 0) {
-      imageUrl = null;
-    } else {
-      imageUrl = result.data.response.hits[0].result.primary_artist.image_url;
-    }
-    return {
-      imageUrl: imageUrl
-    }
+  let imageUrl: string | null = null;
+  if (result.status === 204 || result.data.response.hits.length === 0) {
+    imageUrl = null;
   } else {
-    throw new functions.https.HttpsError('invalid-argument', 'Invalid version');
+    imageUrl = result.data.response.hits[0].result.primary_artist.image_url;
   }
+  return { imageUrl };
 });
 
 // Billing stuff
 const billing = google.cloudbilling("v1").projects;
 const PROJECT_ID = process.env.GCLOUD_PROJECT;
 const PROJECT_NAME = `projects/${PROJECT_ID}`;
+
+interface BillingMessage {
+  costAmount: number;
+  budgetAmount: number;
+  currencyCode: string;
+}
 
 function setCredentialsForBilling() {
   const client = new GoogleAuth({
@@ -75,13 +78,16 @@ function setCredentialsForBilling() {
  *  * guide how to disable billing - https://cloud.google.com/billing/docs/how-to/notify#test-your-cloud-function
  *  * same, but a playlist of a few videos - https://www.youtube.com/watch?v=Dk3VvRSrQIY&list=PLl-K7zZEsYLmK1tiMBeKA0iDMPDCJKM-5&index=7
  */
-export const receiveBillingNotice = functions.pubsub.topic('billing').onPublish(async (message) => {
-  const data = message.json;
-  if (data.costAmount >= data.budgetAmount) {
-    console.error(`DISABLING BILLING FOR ${PROJECT_NAME} DUE TO COST EXCEEDING LIMITATIONS. cost = ${data.costAmount} ${data.currencyCode}, budget = ${data.budgetAmount} ${data.currencyCode}`);
-    await killBilling();
-  }
-});
+export const receiveBillingNoticeV2 = functions.pubsub
+  .onMessagePublished<BillingMessage>('billing', async (event) => {
+    const { costAmount, budgetAmount, currencyCode } = event.data.message.json;
+    if (costAmount >= budgetAmount) {
+      functions.logger.error(`DISABLING BILLING FOR ${PROJECT_NAME} DUE TO COST EXCEEDING LIMITATIONS. cost = ${costAmount} ${currencyCode}, budget = ${budgetAmount} ${currencyCode}`);
+      await killBilling();
+    } else {
+      functions.logger.info(`Billing is OK costAmount=${costAmount} < budgetAmount=${budgetAmount}`);
+    }
+  });
 
 /** Kills the billing for the current project */
 async function killBilling() {
@@ -92,7 +98,7 @@ async function killBilling() {
       await billing.updateBillingInfo({
         name: PROJECT_NAME,
         requestBody: {
-          billingAccountName: '',
+          billingAccountName: '', // This disables billing
         },
       });
     } else {
